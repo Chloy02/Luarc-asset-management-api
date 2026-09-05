@@ -5,7 +5,7 @@ import { requireAuth } from '../auth/middleware.ts';
 import { pageQuery } from '../lib/pagination.ts';
 import { notFound } from '../lib/problem.ts';
 import { parse, parseId } from '../lib/validate.ts';
-import { createCoupon, getCoupon, listCoupons, STATS_CACHE_KEY, updateCoupon } from './service.ts';
+import { claimCoupon, createCoupon, getCoupon, listCoupons, STATS_CACHE_KEY, updateCoupon } from './service.ts';
 
 const code = z
   .string()
@@ -76,5 +76,10 @@ export function registerCouponRoutes(app: Express, ctx: AppContext): void {
     res.json(coupon);
   });
 
-  // POST  /coupons/:id/claims     (Task 8)
+  app.post('/coupons/:id/claims', auth, async (req, res) => {
+    const id = parseId(req.params.id as string);
+    const claim = await claimCoupon(ctx.db, id, req.user!.id);
+    await ctx.cache.del(STATS_CACHE_KEY);
+    res.status(201).json(claim);
+  });
 }

@@ -156,3 +156,63 @@ export async function updateCoupon(db: Db, id: string, ownerId: string, patch: C
   }
   return (await getCoupon(db, id, ownerId))!;
 }
+
+export interface ClaimResult {
+  id: number;
+  coupon_id: string;
+  user_id: string;
+  claimed_at: Date;
+  remaining: number;
+}
+
+/**
+ * The consistency core. Two statements, one short transaction, READ COMMITTED, no explicit locks.
+ *
+ *  1. INSERT the claim first. A duplicate dies on the unique index (23505 → 409) without ever
+ *     touching the contended coupon row. A bad coupon id dies on the FK (23503 → 404).
+ *  2. Conditional UPDATE. Postgres takes the row lock inside the UPDATE and re-evaluates the WHERE
+ *     against the newest committed row after any concurrent writer finishes, so the increment is
+ *     a true compare-and-swap: N racing claims on Q units yield exactly Q successes.
+ *     Zero rows means the predicate failed; we read the row once to say why, then the throw rolls
+ *     the INSERT back.
+ *
+ * Deadlock-free: every claim touches its own new claims row, then one coupon row. The FK check
+ * takes FOR KEY SHARE on the coupon; the UPDATE of non-key columns takes FOR NO KEY UPDATE, which
+ * is compatible with it. Claims on the same coupon simply queue.
+ *
+ * Even if this code were wrong, `coupons_claimed_within_total` (CHECK) would refuse to oversell.
+ */
+export async function claimCoupon(db: Db, couponId: string, userId: string): Promise<ClaimResult> {
+  return db.transaction().execute(async (trx) => {
+    const claim = await trx
+      .insertInto('claims')
+      .values({ coupon_id: couponId, user_id: userId })
+      .returning(['id', 'coupon_id', 'user_id', 'claimed_at'])
+      .executeTakeFirstOrThrow();
+
+    const { rows } = await sql<{ claimed_count: number; total_quantity: number }>`
+      UPDATE coupons
+         SET claimed_count = claimed_count + 1,
+             updated_at    = now()
+       WHERE id = ${couponId}
+         AND status = 'active'
+         AND (expires_at IS NULL OR expires_at > now())
+         AND claimed_count < total_quantity
+      RETURNING claimed_count, total_quantity
+    `.execute(trx);
+
+    const updated = rows[0];
+    if (!updated) {
+      // The FK check above proved the coupon exists, so this read cannot miss.
+      const c = await trx.selectFrom('coupons').select(['code', 'status', 'expires_at']).where('id', '=', couponId).executeTakeFirstOrThrow();
+      const [slug, title, why] =
+        c.status !== 'active'
+          ? ['coupon-disabled', 'Coupon disabled', 'it has been disabled by its owner']
+          : c.expires_at && c.expires_at.getTime() <= Date.now()
+            ? ['coupon-expired', 'Coupon expired', 'it has expired']
+            : ['coupon-sold-out', 'Coupon sold out', 'all units have been claimed'];
+      throw new HttpProblem(410, slug, title, `Coupon ${c.code} cannot be claimed: ${why}.`);
+    }
+    return { ...claim, remaining: updated.total_quantity - updated.claimed_count };
+  });
+}
