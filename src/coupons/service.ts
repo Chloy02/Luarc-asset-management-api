@@ -216,3 +216,39 @@ export async function claimCoupon(db: Db, couponId: string, userId: string): Pro
     return { ...claim, remaining: updated.total_quantity - updated.claimed_count };
   });
 }
+
+export interface Stats {
+  total_coupons: number;
+  active_coupons: number;
+  total_units: number;
+  claimed_units: number;
+  remaining_units: number;
+  total_claims: number;
+  unique_claimers: number;
+  generated_at: string;
+}
+
+/**
+ * claimed_units (SUM of the denormalised counter) and total_claims (COUNT of claim rows) come from
+ * different tables and must always be equal. Exposing both makes the consistency guarantee visible.
+ */
+export async function couponStats(db: Db): Promise<Stats> {
+  const { rows } = await sql<Omit<Stats, 'generated_at'>>`
+    WITH c AS (
+      SELECT count(*)::int                                   AS total_coupons,
+             count(*) FILTER (WHERE status = 'active')::int  AS active_coupons,
+             coalesce(sum(total_quantity), 0)::bigint        AS total_units,
+             coalesce(sum(claimed_count), 0)::bigint         AS claimed_units
+        FROM coupons
+    ), k AS (
+      SELECT count(*)::bigint               AS total_claims,
+             count(DISTINCT user_id)::int   AS unique_claimers
+        FROM claims
+    )
+    SELECT c.total_coupons, c.active_coupons, c.total_units, c.claimed_units,
+           (c.total_units - c.claimed_units)::bigint AS remaining_units,
+           k.total_claims, k.unique_claimers
+      FROM c, k
+  `.execute(db);
+  return { ...rows[0]!, generated_at: new Date().toISOString() };
+}

@@ -5,7 +5,7 @@ import { requireAuth } from '../auth/middleware.ts';
 import { pageQuery } from '../lib/pagination.ts';
 import { notFound } from '../lib/problem.ts';
 import { parse, parseId } from '../lib/validate.ts';
-import { claimCoupon, createCoupon, getCoupon, listCoupons, STATS_CACHE_KEY, updateCoupon } from './service.ts';
+import { claimCoupon, couponStats, createCoupon, getCoupon, listCoupons, STATS_CACHE_KEY, updateCoupon } from './service.ts';
 
 const code = z
   .string()
@@ -56,7 +56,20 @@ export function registerCouponRoutes(app: Express, ctx: AppContext): void {
     res.json(await listCoupons(ctx.db, req.user!.id, filters));
   });
 
-  // GET /coupons/stats is registered here in Task 10 and MUST come before /coupons/:id.
+  // Must be registered before /coupons/:id or Express would treat "stats" as an id.
+  app.get('/coupons/stats', auth, async (_req, res) => {
+    const cached = await ctx.cache.get(STATS_CACHE_KEY);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      res.type('application/json').send(cached);
+      return;
+    }
+    // Read-only aggregate, allowed to be STATS_CACHE_TTL_SECONDS stale. Every write path DELs the key.
+    const body = JSON.stringify(await couponStats(ctx.db));
+    await ctx.cache.set(STATS_CACHE_KEY, body, ctx.config.STATS_CACHE_TTL_SECONDS);
+    res.setHeader('X-Cache', 'MISS');
+    res.type('application/json').send(body);
+  });
 
   app.get('/coupons/:id', auth, async (req, res) => {
     // Passing `auth` (a plain RequestHandler<ParamsDictionary>) alongside this handler in the same

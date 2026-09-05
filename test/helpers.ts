@@ -22,12 +22,17 @@ export interface TestContext {
 export const TEST_PASSWORD = 'correct horse battery staple';
 
 /** Boot the real app on an ephemeral port against the test database, migrated and truncated. */
-export async function bootTestApp(overrides: Partial<Config> = {}): Promise<TestContext> {
+export async function bootTestApp(overrides: Partial<Config> = {}, opts: { awaitRedis?: boolean } = {}): Promise<TestContext> {
   const config: Config = { ...loadConfig(), ...overrides };
   const logger = pino({ level: 'silent' });
   const db = createDb(config.DATABASE_URL, config.PG_POOL_MAX);
   const redis = createRedis(config.REDIS_URL, logger);
-  await redis.connect();
+  if (opts.awaitRedis === false) {
+    // Mirrors server.ts: start without Redis and let the client retry in the background.
+    redis.connect().catch(() => {});
+  } else {
+    await redis.connect();
+  }
   await migrateToLatest(db);
   const { app, ctx } = createApp({ config, db, redis, logger });
   const server = await new Promise<Server>((resolve) => {
@@ -44,7 +49,11 @@ export async function bootTestApp(overrides: Partial<Config> = {}): Promise<Test
       server.closeAllConnections();
       await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())));
       await db.destroy();
-      redis.destroy();
+      try {
+        redis.destroy();
+      } catch {
+        // never connected
+      }
     },
   };
   await resetState(t);
@@ -53,7 +62,9 @@ export async function bootTestApp(overrides: Partial<Config> = {}): Promise<Test
 
 export async function resetState(t: TestContext): Promise<void> {
   await sql`TRUNCATE claims, refresh_tokens, coupons, users RESTART IDENTITY CASCADE`.execute(t.db);
-  await t.redis.flushDb();
+  await t.redis.flushDb().catch(() => {
+    // Redis intentionally unreachable in the fail-open test.
+  });
 }
 
 let sharedHash: Promise<string> | undefined;
