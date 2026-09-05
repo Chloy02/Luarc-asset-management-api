@@ -18,21 +18,21 @@ const totalQuantity = z.number().int().min(1).max(1_000_000_000);
 const expiresAt = z.iso.datetime({ offset: true }).nullish();
 const status = z.enum(['active', 'disabled']);
 
-const createBody = z.object({ code, title, description, total_quantity: totalQuantity, expires_at: expiresAt });
+const createBody = z.strictObject({ code, title, description, total_quantity: totalQuantity, expires_at: expiresAt });
+
+const patchShape = {
+  version: z.number().int().min(1),
+  title: title.optional(),
+  description,
+  total_quantity: totalQuantity.optional(),
+  status: status.optional(),
+  expires_at: expiresAt,
+};
+const EDITABLE = Object.keys(patchShape).filter((k) => k !== 'version') as (keyof typeof patchShape)[];
 
 const patchBody = z
-  .strictObject({
-    version: z.number().int().min(1),
-    title: title.optional(),
-    description,
-    total_quantity: totalQuantity.optional(),
-    status: status.optional(),
-    expires_at: expiresAt,
-  })
-  .refine(
-    (b) => ['title', 'description', 'total_quantity', 'status', 'expires_at'].some((k) => b[k as keyof typeof b] !== undefined),
-    { message: 'At least one editable field is required', path: [] },
-  );
+  .strictObject(patchShape)
+  .refine((b) => EDITABLE.some((k) => b[k] !== undefined), { message: 'At least one editable field is required', path: [] });
 
 const listQuery = z.object({
   status: status.optional(),

@@ -88,7 +88,9 @@ export const notFoundHandler: RequestHandler = (req) => {
 
 export function errorHandler(logger: Logger): ErrorRequestHandler {
   // Express identifies error middleware by arity, so all four parameters must be declared.
-  return (err, req, res, _next) => {
+  return (err, req, res, next) => {
+    // Once the response has started, no problem body can be written; hand it to Express to close.
+    if (res.headersSent) return next(err);
     const problem = toProblem(err);
     const requestId = String(req.id ?? '');
     if (problem.status >= 500) {

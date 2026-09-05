@@ -91,7 +91,14 @@ export function registerAuthRoutes(app: Express, ctx: AppContext): void {
     // Returns 'invalid' instead of throwing so the reuse-detection revocation below COMMITS.
     // Throwing inside the callback would roll it back.
     const outcome = await db.transaction().execute(async (trx): Promise<TokenPair | 'invalid'> => {
-      // FOR UPDATE serialises concurrent refreshes of the same token; the loser sees revoked_at.
+      // Unlocked read, only to learn whose row this is.
+      const owner = await trx.selectFrom('refresh_tokens').select('user_id').where('token_hash', '=', hash).executeTakeFirst();
+      if (!owner) return 'invalid';
+      // Lock order: users row → refresh_tokens rows. Every refresh for this user serialises here,
+      // so the multi-row family revocation below can never deadlock with a concurrent refresh.
+      await trx.selectFrom('users').select('id').where('id', '=', owner.user_id).forUpdate().execute();
+
+      // Re-read under FOR UPDATE: the token's state may have changed while we waited for the user lock.
       const row = await trx.selectFrom('refresh_tokens').selectAll().where('token_hash', '=', hash).forUpdate().executeTakeFirst();
       if (!row) return 'invalid';
       if (row.revoked_at) {

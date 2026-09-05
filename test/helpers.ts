@@ -108,7 +108,6 @@ export interface ApiResponse {
   status: number;
   headers: Headers;
   // Response shapes vary per endpoint; tests assert on them explicitly.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   body: any;
 }
 

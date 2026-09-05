@@ -37,18 +37,9 @@ export function createApp(deps: AppDeps): { app: Express; ctx: AppContext } {
   const app = express();
   app.set('trust proxy', config.TRUST_PROXY);
   app.disable('x-powered-by');
-  app.use(
-    helmet({
-      // Swagger UI (Task 12) needs inline script/style from our own origin. Everything else stays default.
-      contentSecurityPolicy: {
-        directives: {
-          ...helmet.contentSecurityPolicy.getDefaultDirectives(),
-          'script-src': ["'self'", "'unsafe-inline'"],
-          'style-src': ["'self'", "'unsafe-inline'"],
-        },
-      },
-    }),
-  );
+  // Defaults everywhere. Swagger UI needs inline script/style; registerDocs relaxes the CSP
+  // for /docs alone rather than weakening it for the whole API.
+  app.use(helmet());
   app.use(
     pinoHttp({
       logger,

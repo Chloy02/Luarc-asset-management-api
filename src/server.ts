@@ -15,6 +15,21 @@ function mustLoadConfig(): Config {
 
 const config = mustLoadConfig();
 const logger = pino({ level: config.LOG_LEVEL, redact: ['req.headers.authorization'] });
+
+// A process in an unknown state must not keep serving; the orchestrator restarts it.
+process.on('unhandledRejection', (err) => {
+  logger.fatal({ err }, 'unhandled rejection');
+  process.exit(1);
+});
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'uncaught exception');
+  process.exit(1);
+});
+
+if (config.NODE_ENV === 'production' && config.JWT_SECRET === 'dev-only-secret-change-me-before-any-real-deployment') {
+  logger.warn('JWT_SECRET is the documented dev default; do not run this configuration outside a local demo');
+}
+
 const db = createDb(config.DATABASE_URL, {
   poolMax: config.PG_POOL_MAX,
   statementTimeoutMs: config.PG_STATEMENT_TIMEOUT_MS,
