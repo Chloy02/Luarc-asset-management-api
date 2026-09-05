@@ -6,6 +6,7 @@ import type { Logger } from 'pino';
 import { pinoHttp } from 'pino-http';
 import type { Config } from './config.ts';
 import type { Db } from './db/index.ts';
+import { registerAuthRoutes } from './auth/routes.ts';
 import { createTokens, type Tokens } from './auth/tokens.ts';
 import { errorHandler, notFoundHandler } from './lib/problem.ts';
 import { createCache, type Cache, type Redis } from './lib/redis.ts';
@@ -75,11 +76,10 @@ export function createApp(deps: AppDeps): { app: Express; ctx: AppContext } {
     res.status(postgres === 'fail' ? 503 : 200).json({ status, checks: { postgres, redis: redisStatus } });
   });
 
-  // Route modules are registered here in later tasks:
-  //   registerAuthRoutes(app, ctx)    (Task 5)
-  //   registerCouponRoutes(app, ctx)  (Task 6)
-  //   registerClaimRoutes(app, ctx)   (Task 11)
-  //   registerDocs(app)               (Task 12)
+  registerAuthRoutes(app, ctx);
+  // registerCouponRoutes(app, ctx)  (Task 6)
+  // registerClaimRoutes(app, ctx)   (Task 11)
+  // registerDocs(app)               (Task 12)
 
   app.use(notFoundHandler);
   app.use(errorHandler(logger));
