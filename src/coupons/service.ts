@@ -1,6 +1,7 @@
 import { sql } from 'kysely';
 import type { CouponStatus, Db } from '../db/index.ts';
 import { decodeStringCursor, page, type Page } from '../lib/pagination.ts';
+import { HttpProblem, notFound } from '../lib/problem.ts';
 
 export const STATS_CACHE_KEY = 'cache:coupons:stats';
 
@@ -102,4 +103,56 @@ export async function listCoupons(db: Db, viewerId: string, f: CouponFilters): P
   if (f.cursor) q = q.where('c.code', '>', decodeStringCursor(f.cursor));
   const rows = await q.orderBy('c.code', 'asc').limit(f.limit + 1).execute();
   return page(rows, f.limit, (r) => r.code);
+}
+
+export interface CouponPatch {
+  version: number;
+  title?: string;
+  description?: string | null;
+  total_quantity?: number;
+  status?: CouponStatus;
+  expires_at?: string | null;
+}
+
+/**
+ * Optimistic locking. `version` increments only on edits, never on claims, so an editor of a
+ * hot coupon is not livelocked by the claim counter changing underneath them (which is why
+ * this is a body field and not an ETag/If-Match pair). The WHERE clause carries ownership,
+ * the version check, and the id in one statement; the CHECK constraint arbitrates shrinking
+ * total_quantity below claimed_count (23514 → 422 in lib/problem.ts).
+ */
+export async function updateCoupon(db: Db, id: string, ownerId: string, patch: CouponPatch): Promise<CouponView> {
+  const updated = await db
+    .updateTable('coupons')
+    .set({
+      ...(patch.title !== undefined ? { title: patch.title } : {}),
+      ...(patch.description !== undefined ? { description: patch.description } : {}),
+      ...(patch.total_quantity !== undefined ? { total_quantity: patch.total_quantity } : {}),
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.expires_at !== undefined ? { expires_at: patch.expires_at === null ? null : new Date(patch.expires_at) } : {}),
+      version: sql<number>`version + 1`,
+      updated_at: sql<Date>`now()`,
+    })
+    .where('id', '=', id)
+    .where('created_by', '=', ownerId)
+    .where('version', '=', patch.version)
+    .returning('id')
+    .executeTakeFirst();
+
+  if (!updated) {
+    // Zero rows: work out which precondition failed, in order of what the client can act on.
+    const current = await db.selectFrom('coupons').select(['created_by', 'version']).where('id', '=', id).executeTakeFirst();
+    if (!current) throw notFound('Coupon');
+    if (current.created_by !== ownerId) {
+      throw new HttpProblem(403, 'forbidden', 'Forbidden', 'Only the coupon owner can modify it.');
+    }
+    throw new HttpProblem(
+      409,
+      'version-conflict',
+      'Version conflict',
+      `Coupon is at version ${current.version}; you sent ${patch.version}. Re-read it and retry.`,
+      { current_version: current.version },
+    );
+  }
+  return (await getCoupon(db, id, ownerId))!;
 }

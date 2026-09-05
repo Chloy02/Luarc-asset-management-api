@@ -5,7 +5,7 @@ import { requireAuth } from '../auth/middleware.ts';
 import { pageQuery } from '../lib/pagination.ts';
 import { notFound } from '../lib/problem.ts';
 import { parse, parseId } from '../lib/validate.ts';
-import { createCoupon, getCoupon, listCoupons, STATS_CACHE_KEY } from './service.ts';
+import { createCoupon, getCoupon, listCoupons, STATS_CACHE_KEY, updateCoupon } from './service.ts';
 
 const code = z
   .string()
@@ -19,6 +19,20 @@ const expiresAt = z.iso.datetime({ offset: true }).nullish();
 const status = z.enum(['active', 'disabled']);
 
 const createBody = z.object({ code, title, description, total_quantity: totalQuantity, expires_at: expiresAt });
+
+const patchBody = z
+  .strictObject({
+    version: z.number().int().min(1),
+    title: title.optional(),
+    description,
+    total_quantity: totalQuantity.optional(),
+    status: status.optional(),
+    expires_at: expiresAt,
+  })
+  .refine(
+    (b) => ['title', 'description', 'total_quantity', 'status', 'expires_at'].some((k) => b[k as keyof typeof b] !== undefined),
+    { message: 'At least one editable field is required', path: [] },
+  );
 
 const listQuery = z.object({
   status: status.optional(),
@@ -54,6 +68,13 @@ export function registerCouponRoutes(app: Express, ctx: AppContext): void {
     res.json(coupon);
   });
 
-  // PATCH /coupons/:id            (Task 7)
+  app.patch('/coupons/:id', auth, async (req, res) => {
+    const id = parseId(req.params.id as string);
+    const patch = parse(patchBody, req.body);
+    const coupon = await updateCoupon(ctx.db, id, req.user!.id, patch);
+    await ctx.cache.del(STATS_CACHE_KEY);
+    res.json(coupon);
+  });
+
   // POST  /coupons/:id/claims     (Task 8)
 }

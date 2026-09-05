@@ -109,3 +109,62 @@ test('list paginates with an opaque keyset cursor and no gaps or duplicates', as
   const badLimit = await api(t, 'GET', '/coupons?limit=500', { token: owner.token });
   assert.equal(badLimit.status, 400);
 });
+
+test('PATCH with the current version succeeds and bumps version', async () => {
+  const c = await createCoupon(t, owner.token, { title: 'Before' });
+  const res = await api(t, 'PATCH', `/coupons/${c.id}`, { token: owner.token, body: { version: 1, title: 'After', description: 'Now with text' } });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.title, 'After');
+  assert.equal(res.body.description, 'Now with text');
+  assert.equal(res.body.version, 2);
+  assert.notEqual(res.body.updated_at, c.updated_at);
+});
+
+test('PATCH with a stale version is a 409 that reports the current version', async () => {
+  const c = await createCoupon(t, owner.token);
+  await api(t, 'PATCH', `/coupons/${c.id}`, { token: owner.token, body: { version: 1, title: 'first edit' } });
+  const stale = await api(t, 'PATCH', `/coupons/${c.id}`, { token: owner.token, body: { version: 1, title: 'second edit' } });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.body.type, '/problems/version-conflict');
+  assert.equal(stale.body.current_version, 2);
+  const unchanged = await api(t, 'GET', `/coupons/${c.id}`, { token: owner.token });
+  assert.equal(unchanged.body.title, 'first edit');
+});
+
+test('PATCH is owner-only and validates the body', async () => {
+  const c = await createCoupon(t, owner.token);
+  const forbidden = await api(t, 'PATCH', `/coupons/${c.id}`, { token: other.token, body: { version: 1, title: 'hijack' } });
+  assert.equal(forbidden.status, 403);
+  assert.equal(forbidden.body.type, '/problems/forbidden');
+
+  const noVersion = await api(t, 'PATCH', `/coupons/${c.id}`, { token: owner.token, body: { title: 'x' } });
+  assert.equal(noVersion.status, 400);
+  const nothingToChange = await api(t, 'PATCH', `/coupons/${c.id}`, { token: owner.token, body: { version: 1 } });
+  assert.equal(nothingToChange.status, 400);
+  const codeImmutable = await api(t, 'PATCH', `/coupons/${c.id}`, { token: owner.token, body: { version: 1, code: 'NEW' } });
+  assert.equal(codeImmutable.status, 400);
+
+  const missing = await api(t, 'PATCH', '/coupons/00000000-0000-4000-8000-000000000000', { token: owner.token, body: { version: 1, title: 'x' } });
+  assert.equal(missing.status, 404);
+});
+
+test('PATCH cannot shrink total_quantity below claimed_count (DB CHECK → 422)', async () => {
+  const c = await createCoupon(t, owner.token, { total_quantity: 10 });
+  await t.db.updateTable('coupons').set({ claimed_count: 5 }).where('id', '=', c.id).execute();
+  const shrink = await api(t, 'PATCH', `/coupons/${c.id}`, { token: owner.token, body: { version: 1, total_quantity: 3 } });
+  assert.equal(shrink.status, 422);
+  assert.equal(shrink.body.type, '/problems/quantity-below-claimed');
+  const grow = await api(t, 'PATCH', `/coupons/${c.id}`, { token: owner.token, body: { version: 1, total_quantity: 5 } });
+  assert.equal(grow.status, 200);
+  assert.equal(grow.body.remaining, 0);
+});
+
+test('PATCH can disable, set and clear expiry', async () => {
+  const c = await createCoupon(t, owner.token, { expires_at: '2030-01-01T00:00:00Z' });
+  const disabled = await api(t, 'PATCH', `/coupons/${c.id}`, { token: owner.token, body: { version: 1, status: 'disabled', expires_at: null } });
+  assert.equal(disabled.status, 200);
+  assert.equal(disabled.body.status, 'disabled');
+  assert.equal(disabled.body.expires_at, null);
+  const listed = await api(t, 'GET', '/coupons?available=true', { token: owner.token });
+  assert.equal(listed.body.data.length, 0);
+});
