@@ -29,10 +29,10 @@ TOKEN=$(curl -s -X POST localhost:3000/auth/login -H 'content-type: application/
   -d '{"email":"demo@luarc.test","password":"demo-password-123"}' | jq -r .access_token)
 
 # 2. See the global pool (RACE-50 has 50 units)
-curl -s localhost:3000/coupons?available=true -H "authorization: Bearer $TOKEN" | jq '.data[] | {code, remaining, claimed_by_me}'
+curl -s 'localhost:3000/coupons?available=true' -H "authorization: Bearer $TOKEN" | jq '.data[] | {code, remaining, claimed_by_me}'
 
 # 3. Claim one
-ID=$(curl -s localhost:3000/coupons?q=RACE-50 -H "authorization: Bearer $TOKEN" | jq -r '.data[0].id')
+ID=$(curl -s 'localhost:3000/coupons?q=RACE-50' -H "authorization: Bearer $TOKEN" | jq -r '.data[0].id')
 curl -s -X POST localhost:3000/coupons/$ID/claims -H "authorization: Bearer $TOKEN" | jq
 
 # 4. Claim again → 409 already-claimed (safe to retry, nothing changes)
@@ -76,7 +76,8 @@ Full contract: [`openapi.yaml`](openapi.yaml), served at `/docs`. A test asserts
 Errors are [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem details. Problem types:
 `validation-error`, `invalid-json`, `payload-too-large`, `unauthorized`, `forbidden`, `not-found`, `email-taken`,
 `invalid-credentials`, `invalid-refresh-token`, `code-taken`, `already-claimed`, `coupon-sold-out`, `coupon-expired`,
-`coupon-disabled`, `version-conflict`, `quantity-below-claimed`, `unknown-user`, `rate-limited`, `internal`.
+`coupon-disabled`, `version-conflict`, `quantity-below-claimed`, `unknown-user`, `rate-limited`, `lock-timeout`,
+`statement-timeout`, `internal`.
 Every error carries the `request_id` that also appears in the structured logs.
 
 ## Data model
@@ -201,18 +202,18 @@ arbitrates the one interaction.
 | 50 claims and 10 edits interleaved on one coupon | no 500s, 30 claims land on 30 units, one edit wins |
 
 ```
-✔ 500 users racing for 50 units: exactly 50 succeed and the counter equals the row count (1401.182889ms)
-✔ one user firing 100 parallel claims lands exactly one (273.708351ms)
-✔ 20 concurrent edits with the same version: exactly one wins (177.014267ms)
-✔ mixed claims and edits on one coupon: no 500s and the invariant holds (286.967433ms)
-ℹ tests 59
+✔ 500 users racing for 50 units: exactly 50 succeed and the counter equals the row count (1340.474504ms)
+✔ one user firing 100 parallel claims lands exactly one (256.106007ms)
+✔ 20 concurrent edits with the same version: exactly one wins (159.247555ms)
+✔ mixed claims and edits on one coupon: no 500s and the invariant holds (269.4249ms)
+ℹ tests 67
 ℹ suites 0
-ℹ pass 59
+ℹ pass 67
 ℹ fail 0
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 17888.935566
+ℹ duration_ms 19068.114863
 ```
 
 Over real HTTP with k6 (`npm run load:prepare && npm run load`, 300 virtual users, 50 units):
@@ -263,8 +264,9 @@ sequenceDiagram
   Claims are `sub`, `email`, `role`, `aud`, `iss`, `iat`, `exp` — the same shape Supabase Auth issues, so a client
   written against Supabase reads ours unchanged.
 - **Refresh tokens**: 256-bit opaque, stored as SHA-256, rotated on every use. Presenting an already-rotated token
-  is treated as theft and revokes the user's whole token family (OAuth 2.0 Security BCP). Clients must not refresh
-  concurrently.
+  is treated as theft and revokes the user's whole token family (OAuth 2.0 Security BCP). A token revoked by logout
+  is indistinguishable from a rotated one, so refreshing after logout is also treated as reuse and revokes the
+  family. Clients must not refresh concurrently.
 - **Not built, on purpose**: verifying Supabase-issued tokens (JWKS, ES256). It would also need user provisioning on
   first sight; half of that feature is worse than none.
 
@@ -287,7 +289,11 @@ Indexes and the queries they serve:
 | `claims_user_id_id_idx (user_id, id)` | `/me/claims`: `WHERE user_id = $1 AND id < $cursor ORDER BY id DESC LIMIT n` — one backward index scan |
 | `coupons_status_code_idx (status, code)` | `/coupons?status=…`: filter + `ORDER BY code` + keyset `code > $cursor` |
 | `coupons_code_key` | code lookup, keyset cursor when unfiltered |
-| `claims_coupon_id_user_id_key` | duplicate-claim gate and `claimed_by_me` join |
+| `claims_coupon_id_user_id_key` | duplicate-claim gate, and the `claimed_by_me` join when the planner prefers it |
+
+Either `claims_coupon_id_user_id_key` or `claims_user_id_id_idx` can serve the `claimed_by_me` join — both lead
+with a column of the join predicate. The pasted plan below picks `claims_user_id_id_idx`, because on a table
+with one claim row the viewer filter alone is the whole selectivity; on a large table the composite key wins.
 
 Pagination is keyset (cursor = last sort key, base64url), not `OFFSET`: stable under concurrent inserts and
 index-friendly at any depth. `claims.id` is a bigint identity so the cursor is exact; timestamps are not used as
@@ -390,6 +396,8 @@ $ EXPLAIN (ANALYZE, BUFFERS) SELECT c.*, mine.user_id IS NOT NULL AS claimed_by_
 | `PORT` | 3000 | |
 | `DATABASE_URL` | – | Postgres connection string |
 | `PG_POOL_MAX` | 10 | Connections per API instance |
+| `PG_STATEMENT_TIMEOUT_MS` | 5000 | Per-connection `statement_timeout`; a runaway query becomes a 503, not a parked connection |
+| `PG_LOCK_TIMEOUT_MS` | 2000 | Per-connection `lock_timeout`; bounds the wait on a contended row |
 | `REDIS_URL` | – | Redis connection string |
 | `JWT_SECRET` | – | HS256 key, ≥ 32 chars |
 | `JWT_ISSUER` / `JWT_AUDIENCE` | luarc-asset-api / authenticated | Verified on every token |
@@ -397,14 +405,18 @@ $ EXPLAIN (ANALYZE, BUFFERS) SELECT c.*, mine.user_id IS NOT NULL AS claimed_by_
 | `REFRESH_TOKEN_TTL_SECONDS` | 2592000 | 30 days |
 | `RATE_LIMIT_AUTH_MAX` / `RATE_LIMIT_AUTH_WINDOW_SECONDS` | 10 / 60 | Per IP on `/auth/*` |
 | `STATS_CACHE_TTL_SECONDS` | 5 | |
-| `TRUST_PROXY` | false | Set true behind a load balancer so rate limiting sees the client IP |
+| `TRUST_PROXY` | false | Hop count or boolean. Behind one load balancer set `TRUST_PROXY=1`; `true` trusts the client-supplied `X-Forwarded-For` and lets anyone bypass the rate limiter |
 | `LOG_LEVEL` | info | pino level |
 
 - Config is validated at startup; a bad value exits with a readable message.
 - Structured JSON logs with a request id per line; `X-Request-Id` is honoured or generated and echoed.
 - `SIGTERM` drains in-flight requests, closes the pool and Redis, exits 0 (10s hard limit) — clean ECS rollouts.
 - `GET /health`: `SELECT 1` and `PING` with timeouts; 503 only if Postgres is down.
-- Tests run in CI against Postgres and Redis service containers; the Docker image is built on every push.
+- A database blip stays a blip: `pool.on('error')` observes idle clients killed by a failover or restart instead
+  of letting the unhandled event take the process down, and `statement_timeout` / `lock_timeout` bound every wait
+  so a stuck query surfaces as a retryable 503 rather than holding a pool connection forever.
+- Tests run in CI against Postgres and Redis service containers; a second job builds the image and boots the whole
+  Compose stack, waiting on `/health` before it passes.
 
 ## Deploying on AWS
 
@@ -424,7 +436,8 @@ flowchart LR
   M[One-off ECS task:<br/>node src/db/migrate.ts] --> RDS
 ```
 
-- The API is stateless; scale ECS tasks horizontally behind the ALB. Set `TRUST_PROXY=true`.
+- The API is stateless; scale ECS tasks horizontally behind the ALB. Set `TRUST_PROXY=1` — exactly one hop, the
+  ALB, so a forged `X-Forwarded-For` cannot bypass the per-IP rate limiter.
 - Run migrations as a one-off task before rolling out the new image, never at container start in production
   (Compose does it at start only for convenience).
 - Secrets come from Secrets Manager into the task definition; nothing is baked into the image.
@@ -438,6 +451,13 @@ RDS-class hardware, far above the brief's "hundreds". Past that, the upgrade pat
 `DECR` reservation with asynchronous reconciliation. Both trade the single-row guarantee for coordination
 complexity, which is the wrong trade at this scale. Everything else — listing, history, stats — scales with
 read replicas and the cache.
+
+**When the hot row is too hot.** Every claim waiting on a contended coupon holds a pool connection while it waits.
+With `PG_POOL_MAX` connections parked on one row, every other endpoint — `/health` included — would starve, and a
+slow coupon would read as a dead API. `lock_timeout` and `statement_timeout` bound that wait: a claim that cannot
+get the row within `PG_LOCK_TIMEOUT_MS` returns 503 `lock-timeout` (or `statement-timeout` for a query that
+overruns) with `Retry-After: 1`, releasing its connection. That is a bounded failure on one coupon instead of a
+cascading one across the whole instance.
 
 ## Trade-offs and omissions
 
@@ -458,6 +478,8 @@ src/
   server.ts            bootstrap + graceful shutdown
   app.ts               createApp(): middleware, health, routes, error handler
   config.ts            zod-validated environment
+  docs.ts              /openapi.yaml + Swagger UI at /docs (its own relaxed CSP)
+  express.d.ts         the req.user augmentation requireAuth sets
   db/                  Kysely types, migration, migrate/seed CLIs
   auth/                scrypt, JWT + refresh tokens, requireAuth, /auth/* routes
   coupons/service.ts   every SQL statement touching coupons and claims (the file to read first)

@@ -42,6 +42,7 @@ paths:
         '409':
           description: Email already registered (`/problems/email-taken`)
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '429': { $ref: '#/components/responses/RateLimited' }
   /auth/login:
     post:
@@ -64,6 +65,7 @@ paths:
         '401':
           description: Invalid credentials (`/problems/invalid-credentials`)
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '429': { $ref: '#/components/responses/RateLimited' }
   /auth/refresh:
     post:
@@ -72,7 +74,8 @@ paths:
       summary: Rotate a refresh token
       description: |
         The presented token is revoked and a new pair is issued. Presenting an already-rotated token is
-        treated as theft: every live refresh token for that user is revoked.
+        treated as theft: every live refresh token for that user is revoked. A token revoked by logout is
+        treated the same as a rotated one: presenting it revokes the family.
       requestBody:
         required: true
         content:
@@ -88,6 +91,7 @@ paths:
         '401':
           description: Unknown, expired, or revoked token (`/problems/invalid-refresh-token`)
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '429': { $ref: '#/components/responses/RateLimited' }
   /auth/logout:
     post:
@@ -102,6 +106,7 @@ paths:
       responses:
         '204': { description: Revoked (also returned for unknown tokens) }
         '400': { $ref: '#/components/responses/ValidationError' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '429': { $ref: '#/components/responses/RateLimited' }
   /me:
     get:
@@ -149,21 +154,30 @@ paths:
             schema: { $ref: '#/components/schemas/CouponCreate' }
       responses:
         '201':
-          description: Created; `Location` header points at the coupon
+          description: Created
+          headers:
+            Location: { schema: { type: string }, description: Path of the new coupon }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Coupon' }
         '400': { $ref: '#/components/responses/ValidationError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/UnknownUser' }
         '409':
           description: Code already exists (`/problems/code-taken`)
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
     get:
       tags: [Coupons]
       summary: The global pool with per-coupon state
       parameters:
         - { name: status, in: query, schema: { $ref: '#/components/schemas/CouponStatus' } }
-        - { name: available, in: query, schema: { type: boolean }, description: Only active, unexpired coupons with remaining > 0 }
+        - name: available
+          in: query
+          schema: { type: boolean }
+          description: >-
+            Only active, unexpired coupons with remaining > 0. Implies status=active; combining it with
+            status=disabled returns nothing.
         - { name: q, in: query, schema: { type: string, maxLength: 64 }, description: Case-insensitive substring of code or title }
         - { $ref: '#/components/parameters/Limit' }
         - { $ref: '#/components/parameters/Cursor' }
@@ -238,9 +252,11 @@ paths:
         '409':
           description: Stale version (`/problems/version-conflict`, includes `current_version`)
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '422':
           description: total_quantity below claimed_count (`/problems/quantity-below-claimed`)
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '503': { $ref: '#/components/responses/DatabaseBusy' }
   /coupons/{id}/claims:
     parameters:
       - { $ref: '#/components/parameters/CouponId' }
@@ -257,6 +273,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ClaimResult' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/UnknownUser' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: Already claimed by this user (`/problems/already-claimed`)
@@ -264,6 +281,7 @@ paths:
         '410':
           description: Unavailable — `/problems/coupon-sold-out`, `/problems/coupon-expired`, or `/problems/coupon-disabled`
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '503': { $ref: '#/components/responses/DatabaseBusy' }
   /health:
     get:
       tags: [Ops]
@@ -313,6 +331,18 @@ components:
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
     RateLimited:
       description: Too many requests (`/problems/rate-limited`, includes `retry_after`; `Retry-After` header set)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    PayloadTooLarge:
+      description: Request body exceeds 100kb (`/problems/payload-too-large`)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    UnknownUser:
+      description: The token verifies but its user no longer exists (`/problems/unknown-user`)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    DatabaseBusy:
+      description: |
+        The database refused to wait any longer (`/problems/lock-timeout` or `/problems/statement-timeout`).
+        `lock_timeout` and `statement_timeout` bound the wait on a contended row so a hot coupon degrades
+        into a retryable 503 instead of parking every pool connection. `Retry-After: 1` is set.
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
   schemas:
     Problem:
