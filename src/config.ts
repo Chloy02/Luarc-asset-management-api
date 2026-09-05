@@ -17,7 +17,11 @@ const schema = z.object({
   RATE_LIMIT_AUTH_MAX: z.coerce.number().int().min(1).default(10),
   RATE_LIMIT_AUTH_WINDOW_SECONDS: z.coerce.number().int().min(1).default(60),
   STATS_CACHE_TTL_SECONDS: z.coerce.number().int().min(1).default(5),
-  TRUST_PROXY: z.stringbool().default(false),
+  // A hop count is the safe setting: `1` trusts exactly one proxy, so req.ip is the address that
+  // proxy saw and the rate limiter cannot be bypassed with a forged X-Forwarded-For. `true` trusts
+  // the whole client-supplied chain. z.coerce.number() rejects "true"/"false" as NaN, so those fall
+  // through to stringbool; "1" parses as the number 1. Express accepts either form.
+  TRUST_PROXY: z.union([z.coerce.number().int().min(0), z.stringbool()]).default(false),
 });
 
 export type Config = z.infer<typeof schema>;

@@ -30,6 +30,12 @@ test('loadConfig coerces numbers and booleans from strings', () => {
   assert.equal(cfg.RATE_LIMIT_AUTH_MAX, 3);
 });
 
+test('TRUST_PROXY accepts a hop count as well as a boolean', () => {
+  assert.equal(loadConfig({ ...minimal, TRUST_PROXY: '1' }).TRUST_PROXY, 1);
+  assert.equal(loadConfig({ ...minimal, TRUST_PROXY: 'true' }).TRUST_PROXY, true);
+  assert.equal(loadConfig({ ...minimal, TRUST_PROXY: 'false' }).TRUST_PROXY, false);
+});
+
 test('loadConfig rejects a short JWT_SECRET with a readable message', () => {
   assert.throws(() => loadConfig({ ...minimal, JWT_SECRET: 'short' }), /JWT_SECRET/);
 });
