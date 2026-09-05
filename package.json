@@ -1,0 +1,39 @@
+{
+  "name": "luarc-asset-management-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Consistency-first coupon/voucher API: authenticated claims that stay correct under concurrency.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --watch --env-file=.env src/server.ts",
+    "start": "node src/server.ts",
+    "migrate": "node --env-file=.env src/db/migrate.ts",
+    "seed": "node --env-file=.env src/db/seed.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --env-file=.env.test --test --test-concurrency=1 'test/**/*.test.ts'",
+    "load:prepare": "node --env-file=.env load/prepare.ts",
+    "load": "docker run --rm --network host -v \"$PWD/load:/load\" -e BASE_URL=http://localhost:3000 grafana/k6 run /load/claim-race.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "helmet": "^8.3.0",
+    "jose": "^6.2.12",
+    "kysely": "^0.29.5",
+    "pg": "^8.23.0",
+    "pino": "^10.3.1",
+    "pino-http": "^11.0.0",
+    "redis": "^6.2.1",
+    "swagger-ui-express": "^5.0.1",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.13.3",
+    "@types/pg": "^8.23.1",
+    "@types/swagger-ui-express": "^4.1.8",
+    "typescript": "^5.9.3"
+  }
+}
