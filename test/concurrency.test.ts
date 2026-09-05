@@ -59,6 +59,7 @@ test('one user firing 100 parallel claims lands exactly one', async () => {
   const results = await Promise.all(Array.from({ length: 100 }, () => api(t, 'POST', `/coupons/${coupon.id}/claims`, { token: alice!.token })));
 
   assert.deepEqual(tally(results), { 201: 1, 409: 99 });
+  for (const r of results.filter((r) => r.status === 409)) assert.equal(r.body.type, '/problems/already-claimed');
   const state = await counterAndRows(coupon.id);
   assert.equal(state.claimed_count, 1);
   assert.equal(state.rows, 1);
@@ -77,6 +78,7 @@ test('20 concurrent edits with the same version: exactly one wins', async () => 
   const winner = results.find((r) => r.status === 200)!;
   const view = await api(t, 'GET', `/coupons/${coupon.id}`, { token: owner.token });
   assert.equal(view.body.title, winner.body.title);
+  assert.match(view.body.title, /^edit \d+$/);
 });
 
 test('mixed claims and edits on one coupon: no 500s and the invariant holds', async () => {
@@ -87,12 +89,9 @@ test('mixed claims and edits on one coupon: no 500s and the invariant holds', as
   const edits = Array.from({ length: 10 }, (_, i) => api(t, 'PATCH', `/coupons/${coupon.id}`, { token: owner.token, body: { version: 1, title: `t${i}` } }));
   const results = await Promise.all([...claims, ...edits]);
 
+  // One deepEqual covers the whole tally, so an unexpected 500 fails here with the counts printed.
   const byStatus = tally(results);
-  assert.equal(byStatus[500] ?? 0, 0, JSON.stringify(byStatus));
-  assert.equal(byStatus[201], 30);
-  assert.equal(byStatus[410], 20);
-  assert.equal(byStatus[200], 1);
-  assert.equal(byStatus[409], 9);
+  assert.deepEqual(byStatus, { 201: 30, 410: 20, 200: 1, 409: 9 }, JSON.stringify(byStatus));
 
   const state = await counterAndRows(coupon.id);
   assert.equal(state.claimed_count, 30);

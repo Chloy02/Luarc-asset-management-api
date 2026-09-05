@@ -7,6 +7,7 @@ import { createApp } from '../src/app.ts';
 import { loadConfig } from '../src/config.ts';
 import { createDb } from '../src/db/index.ts';
 import { createRedis } from '../src/lib/redis.ts';
+import { api, bootTestApp } from './helpers.ts';
 
 /** Every route registered on the Express app must be documented. Minimal YAML walk; we control the file's shape. */
 function documentedOperations(yaml: string): Set<string> {
@@ -31,7 +32,11 @@ function documentedOperations(yaml: string): Set<string> {
   return ops;
 }
 
-function registeredOperations(): Set<string> {
+/**
+ * Only `app.<method>()` routes are enumerated; `app.use()` mounts such as /docs are middleware and
+ * are intentionally outside this contract.
+ */
+async function registeredOperations(): Promise<Set<string>> {
   const config = loadConfig();
   const logger = pino({ level: 'silent' });
   const db = createDb(config.DATABASE_URL, { poolMax: 1 });
@@ -45,17 +50,39 @@ function registeredOperations(): Set<string> {
     const oaPath = layer.route.path.replace(/:([A-Za-z_]+)/g, '{$1}');
     for (const method of Object.keys(layer.route.methods)) ops.add(`${method.toUpperCase()} ${oaPath}`);
   }
-  void db.destroy();
+  await db.destroy();
   return ops;
 }
 
-test('every Express route is documented in openapi.yaml', () => {
+test('every Express route is documented in openapi.yaml', async () => {
   const yaml = readFileSync(path.join(import.meta.dirname, '..', 'openapi.yaml'), 'utf8');
   const documented = documentedOperations(yaml);
-  const registered = registeredOperations();
+  const registered = await registeredOperations();
   registered.delete('GET /openapi.yaml');
   const missing = [...registered].filter((op) => !documented.has(op)).sort();
   assert.deepEqual(missing, [], `undocumented routes: ${missing.join(', ')}`);
   const stale = [...documented].filter((op) => !registered.has(op)).sort();
   assert.deepEqual(stale, [], `documented but not registered: ${stale.join(', ')}`);
+});
+
+test('serves the spec and Swagger UI over HTTP', async () => {
+  const t = await bootTestApp();
+  try {
+    const spec = await api(t, 'GET', '/openapi.yaml');
+    assert.equal(spec.status, 200);
+    assert.match(spec.headers.get('content-type') ?? '', /application\/yaml/);
+    assert.ok(String(spec.body).startsWith('openapi: 3.1.0'));
+
+    const ui = await api(t, 'GET', '/docs/');
+    assert.equal(ui.status, 200);
+    assert.match(ui.headers.get('content-type') ?? '', /text\/html/);
+    // Swagger UI's inline script/style is allowed on /docs and nowhere else.
+    assert.match(ui.headers.get('content-security-policy') ?? '', /script-src 'self' 'unsafe-inline'/);
+    const health = await api(t, 'GET', '/health');
+    const csp = health.headers.get('content-security-policy') ?? '';
+    assert.match(csp, /script-src 'self';/);
+    assert.doesNotMatch(csp, /script-src 'self' 'unsafe-inline'/, 'the relaxed CSP must not leak past /docs');
+  } finally {
+    await t.close();
+  }
 });

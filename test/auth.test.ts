@@ -1,6 +1,6 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { api, bootTestApp, createUser, resetState, TEST_PASSWORD, type TestContext } from './helpers.ts';
+import { api, bootTestApp, createCoupon, createUser, resetState, TEST_PASSWORD, type TestContext } from './helpers.ts';
 
 let t: TestContext;
 before(async () => {
@@ -72,6 +72,33 @@ test('protected routes require a valid bearer token', async () => {
   assert.equal(ok.status, 200);
   assert.equal(ok.body.email, user.email);
   assert.equal(ok.body.id, user.id);
+  // The auth scheme is case-insensitive per RFC 9110.
+  const lowercase = await api(t, 'GET', '/me', { headers: { authorization: `bearer ${user.token}` } });
+  assert.equal(lowercase.status, 200);
+  assert.equal(lowercase.body.id, user.id);
+});
+
+test('a deleted user with a live token gets 403 on writes and 404 on /me', async () => {
+  const ghost = await createUser(t);
+  const survivor = await createUser(t);
+  const coupon = await createCoupon(t, survivor.token);
+  await t.db.deleteFrom('users').where('id', '=', ghost.id).execute();
+
+  // The token still verifies; the foreign keys are what refuse the write.
+  const created = await api(t, 'POST', '/coupons', {
+    token: ghost.token,
+    body: { code: 'GHOST-1', title: 'x', total_quantity: 1 },
+  });
+  assert.equal(created.status, 403);
+  assert.equal(created.body.type, '/problems/unknown-user');
+
+  const me = await api(t, 'GET', '/me', { token: ghost.token });
+  assert.equal(me.status, 404);
+  assert.equal(me.body.type, '/problems/not-found');
+
+  const claim = await api(t, 'POST', `/coupons/${coupon.id}/claims`, { token: ghost.token });
+  assert.equal(claim.status, 403);
+  assert.equal(claim.body.type, '/problems/unknown-user');
 });
 
 test('refresh rotates the token and the old one stops working', async () => {

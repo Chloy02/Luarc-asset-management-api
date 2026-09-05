@@ -87,6 +87,18 @@ test('list filters by status, availability, and text; orders by code', async () 
   assert.deepEqual(byCode.body.data.map((c: { code: string }) => c.code), ['D-EXPIRED']);
 });
 
+test('search escapes LIKE wildcards', async () => {
+  await createCoupon(t, owner.token, { title: 'Fifty% off' });
+  await createCoupon(t, owner.token, { title: 'Alpha' });
+  // '%' and '_' are literals to the caller, not wildcards, so a bare '%' cannot list the whole pool.
+  const percent = await api(t, 'GET', '/coupons?q=%25', { token: owner.token });
+  assert.deepEqual(percent.body.data.map((c: { title: string }) => c.title), ['Fifty% off']);
+  const underscore = await api(t, 'GET', '/coupons?q=_', { token: owner.token });
+  assert.deepEqual(underscore.body.data, []);
+  const backslash = await api(t, 'GET', '/coupons?q=%5C', { token: owner.token });
+  assert.deepEqual(backslash.body.data, []);
+});
+
 test('list paginates with an opaque keyset cursor and no gaps or duplicates', async () => {
   for (let i = 0; i < 5; i++) await createCoupon(t, owner.token, { code: `P-${i}` });
   const seen: string[] = [];
