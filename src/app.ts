@@ -10,6 +10,7 @@ import { registerAuthRoutes } from './auth/routes.ts';
 import { createTokens, type Tokens } from './auth/tokens.ts';
 import { registerClaimRoutes } from './claims/routes.ts';
 import { registerCouponRoutes } from './coupons/routes.ts';
+import { registerDocs } from './docs.ts';
 import { errorHandler, notFoundHandler } from './lib/problem.ts';
 import { createCache, type Cache, type Redis } from './lib/redis.ts';
 
@@ -81,7 +82,7 @@ export function createApp(deps: AppDeps): { app: Express; ctx: AppContext } {
   registerAuthRoutes(app, ctx);
   registerCouponRoutes(app, ctx);
   registerClaimRoutes(app, ctx);
-  // registerDocs(app)               (Task 12)
+  registerDocs(app);
 
   app.use(notFoundHandler);
   app.use(errorHandler(logger));

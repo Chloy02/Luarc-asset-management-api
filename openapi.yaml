@@ -1,0 +1,449 @@
+openapi: 3.1.0
+info:
+  title: Luarc Asset Management API
+  version: 1.0.0
+  description: |
+    Authenticated coupon/voucher pool that stays consistent under concurrent claims and edits.
+
+    **Consistency model.** Claiming is a single transaction: insert the claim row (unique per user and coupon),
+    then a conditional `UPDATE ... WHERE claimed_count < total_quantity`. Postgres row locking makes the
+    increment a compare-and-swap, and a CHECK constraint makes overselling structurally impossible.
+    Editing a coupon uses optimistic locking: send the `version` you last saw; a stale version is a 409.
+
+    **Errors** are RFC 9457 problem details (`application/problem+json`) with `type: /problems/<slug>` and a
+    `request_id` you can quote when reporting an issue.
+servers:
+  - url: http://localhost:3000
+tags:
+  - name: Auth
+  - name: Coupons
+  - name: Claims
+  - name: Ops
+security:
+  - bearerAuth: []
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Create an account and receive a token pair
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Credentials' }
+      responses:
+        '201':
+          description: Account created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409':
+          description: Email already registered (`/problems/email-taken`)
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Exchange credentials for a token pair
+      description: Unknown email and wrong password return the same body and take the same code path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Credentials' }
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Invalid credentials (`/problems/invalid-credentials`)
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Rotate a refresh token
+      description: |
+        The presented token is revoked and a new pair is issued. Presenting an already-rotated token is
+        treated as theft: every live refresh token for that user is revoked.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Unknown, expired, or revoked token (`/problems/invalid-refresh-token`)
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Revoke a refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '204': { description: Revoked (also returned for unknown tokens) }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /me:
+    get:
+      tags: [Auth]
+      summary: The authenticated user
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /me/claims:
+    get:
+      tags: [Claims]
+      summary: The caller's claim history (claims joined to coupons)
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date-time }, description: Inclusive lower bound on claimed_at }
+        - { name: to, in: query, schema: { type: string, format: date-time }, description: Exclusive upper bound on claimed_at }
+        - { name: coupon_status, in: query, schema: { $ref: '#/components/schemas/CouponStatus' } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Newest first, keyset-paginated on claim id
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, next_cursor]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/ClaimHistoryRow' } }
+                  next_cursor: { type: [string, 'null'] }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /coupons:
+    post:
+      tags: [Coupons]
+      summary: Create a coupon
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CouponCreate' }
+      responses:
+        '201':
+          description: Created; `Location` header points at the coupon
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Coupon' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Code already exists (`/problems/code-taken`)
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    get:
+      tags: [Coupons]
+      summary: The global pool with per-coupon state
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/CouponStatus' } }
+        - { name: available, in: query, schema: { type: boolean }, description: Only active, unexpired coupons with remaining > 0 }
+        - { name: q, in: query, schema: { type: string, maxLength: 64 }, description: Case-insensitive substring of code or title }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Ordered by code, keyset-paginated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, next_cursor]
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Coupon' } }
+                  next_cursor: { type: [string, 'null'] }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /coupons/stats:
+    get:
+      tags: [Coupons]
+      summary: Aggregate pool statistics
+      description: |
+        Served from Redis for up to `STATS_CACHE_TTL_SECONDS` (default 5) and invalidated on every write.
+        `X-Cache: HIT|MISS` says which. `claimed_units` (sum of counters) and `total_claims` (count of rows)
+        are computed from different tables and are always equal.
+      responses:
+        '200':
+          description: Statistics
+          headers:
+            X-Cache: { schema: { type: string, enum: [HIT, MISS] } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /coupons/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/CouponId' }
+    get:
+      tags: [Coupons]
+      summary: One coupon with the caller's claim status
+      responses:
+        '200':
+          description: Coupon
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Coupon' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Coupons]
+      summary: Edit a coupon (owner only, optimistic locking)
+      description: |
+        Send the `version` you last read. If the coupon was edited since, you get 409 with `current_version`.
+        Claims never change `version`, so editing a busy coupon is not livelocked by the counter.
+        Shrinking `total_quantity` below `claimed_count` is refused by a database CHECK constraint (422).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CouponPatch' }
+      responses:
+        '200':
+          description: Updated coupon with the new version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Coupon' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Not the owner (`/problems/forbidden`)
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Stale version (`/problems/version-conflict`, includes `current_version`)
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '422':
+          description: total_quantity below claimed_count (`/problems/quantity-below-claimed`)
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+  /coupons/{id}/claims:
+    parameters:
+      - { $ref: '#/components/parameters/CouponId' }
+    post:
+      tags: [Claims]
+      summary: Claim one unit of a coupon
+      description: |
+        Atomic under any level of concurrency: N users racing for Q units get exactly Q 201s.
+        One claim per user per coupon; a repeat is a 409 and is safe to retry.
+      responses:
+        '201':
+          description: Claimed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClaimResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Already claimed by this user (`/problems/already-claimed`)
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '410':
+          description: Unavailable — `/problems/coupon-sold-out`, `/problems/coupon-expired`, or `/problems/coupon-disabled`
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+  /health:
+    get:
+      tags: [Ops]
+      security: []
+      summary: Liveness and dependency checks
+      responses:
+        '200':
+          description: Postgres reachable (Redis may be `fail`, in which case status is `degraded`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Postgres unreachable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    CouponId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque cursor from a previous response's `next_cursor`
+  responses:
+    ValidationError:
+      description: Invalid input (`/problems/validation-error`, includes `errors[]`)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    Unauthorized:
+      description: Missing or invalid bearer token (`/problems/unauthorized`)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    NotFound:
+      description: Not found (`/problems/not-found`)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    RateLimited:
+      description: Too many requests (`/problems/rate-limited`, includes `retry_after`; `Retry-After` header set)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, instance, request_id]
+      properties:
+        type: { type: string, example: /problems/already-claimed }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        request_id: { type: string }
+      additionalProperties: true
+    Credentials:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, minLength: 8, maxLength: 128 }
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+    User:
+      type: object
+      required: [id, email, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        created_at: { type: string, format: date-time }
+    TokenPair:
+      type: object
+      required: [access_token, token_type, expires_in, refresh_token]
+      properties:
+        access_token: { type: string, description: 'JWT (HS256). Claims: sub, email, role, aud, iss, iat, exp' }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer, description: Access token lifetime in seconds }
+        refresh_token: { type: string, description: Opaque; shown once, stored hashed }
+    AuthResponse:
+      allOf:
+        - $ref: '#/components/schemas/TokenPair'
+        - type: object
+          required: [user]
+          properties:
+            user: { $ref: '#/components/schemas/User' }
+    CouponStatus:
+      type: string
+      enum: [active, disabled]
+    Coupon:
+      type: object
+      required: [id, code, title, description, status, total_quantity, claimed_count, remaining, expires_at, version, created_by, created_at, updated_at, claimed_by_me]
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, pattern: '^[A-Z0-9][A-Z0-9-]{1,31}$' }
+        title: { type: string }
+        description: { type: [string, 'null'] }
+        status: { $ref: '#/components/schemas/CouponStatus' }
+        total_quantity: { type: integer }
+        claimed_count: { type: integer, description: Denormalised counter; always equals the number of claim rows }
+        remaining: { type: integer, description: total_quantity - claimed_count }
+        expires_at: { type: [string, 'null'], format: date-time }
+        version: { type: integer, description: Increments on every edit; unchanged by claims }
+        created_by: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        claimed_by_me: { type: boolean }
+    CouponCreate:
+      type: object
+      required: [code, title, total_quantity]
+      properties:
+        code: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9-]{1,31}$', description: Stored upper-cased; immutable }
+        title: { type: string, minLength: 1, maxLength: 120 }
+        description: { type: [string, 'null'], maxLength: 2000 }
+        total_quantity: { type: integer, minimum: 1 }
+        expires_at: { type: [string, 'null'], format: date-time }
+    CouponPatch:
+      type: object
+      required: [version]
+      description: version plus at least one editable field
+      properties:
+        version: { type: integer, minimum: 1 }
+        title: { type: string, minLength: 1, maxLength: 120 }
+        description: { type: [string, 'null'], maxLength: 2000 }
+        total_quantity: { type: integer, minimum: 1 }
+        status: { $ref: '#/components/schemas/CouponStatus' }
+        expires_at: { type: [string, 'null'], format: date-time }
+      additionalProperties: false
+    ClaimResult:
+      type: object
+      required: [id, coupon_id, user_id, claimed_at, remaining]
+      properties:
+        id: { type: integer }
+        coupon_id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        claimed_at: { type: string, format: date-time }
+        remaining: { type: integer }
+    ClaimHistoryRow:
+      type: object
+      required: [id, claimed_at, coupon]
+      properties:
+        id: { type: integer }
+        claimed_at: { type: string, format: date-time }
+        coupon:
+          type: object
+          required: [id, code, title, status, expires_at]
+          properties:
+            id: { type: string, format: uuid }
+            code: { type: string }
+            title: { type: string }
+            status: { $ref: '#/components/schemas/CouponStatus' }
+            expires_at: { type: [string, 'null'], format: date-time }
+    Stats:
+      type: object
+      required: [total_coupons, active_coupons, total_units, claimed_units, remaining_units, total_claims, unique_claimers, generated_at]
+      properties:
+        total_coupons: { type: integer }
+        active_coupons: { type: integer }
+        total_units: { type: integer }
+        claimed_units: { type: integer }
+        remaining_units: { type: integer }
+        total_claims: { type: integer }
+        unique_claimers: { type: integer }
+        generated_at: { type: string, format: date-time }
+    Health:
+      type: object
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ok, degraded, fail] }
+        checks:
+          type: object
+          properties:
+            postgres: { type: string, enum: [ok, fail] }
+            redis: { type: string, enum: [ok, fail] }
