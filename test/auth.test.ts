@@ -113,7 +113,7 @@ test('logout revokes the refresh token and always returns 204', async () => {
 test('auth routes are rate limited per IP', async () => {
   const limited = await bootTestApp({ RATE_LIMIT_AUTH_MAX: 3, RATE_LIMIT_AUTH_WINDOW_SECONDS: 60 });
   try {
-    const attempt = () => api(limited, 'POST', '/auth/login', { body: { email: 'x@y.z', password: TEST_PASSWORD } });
+    const attempt = () => api(limited, 'POST', '/auth/login', { body: { email: 'nobody@example.com', password: TEST_PASSWORD } });
     for (let i = 0; i < 3; i++) assert.equal((await attempt()).status, 401);
     const blocked = await attempt();
     assert.equal(blocked.status, 429);
