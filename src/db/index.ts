@@ -54,7 +54,31 @@ export interface Database {
 
 export type Db = Kysely<Database>;
 
-export function createDb(connectionString: string, poolMax: number): Db {
-  const pool = new pg.Pool({ connectionString, max: poolMax, connectionTimeoutMillis: 5000 });
+export interface DbOptions {
+  poolMax: number;
+  /**
+   * Per-connection timeouts. Omitted by the migrate/seed CLIs, whose DDL is legitimately slow;
+   * every request-serving pool sets them from config so a stuck query cannot park a connection.
+   */
+  statementTimeoutMs?: number;
+  lockTimeoutMs?: number;
+  onError?: (err: Error) => void;
+}
+
+const defaultOnError = (err: Error) => console.error('postgres pool error:', err.message);
+
+export function createDb(connectionString: string, opts: DbOptions): Db {
+  const pool = new pg.Pool({
+    connectionString,
+    max: opts.poolMax,
+    connectionTimeoutMillis: 5000,
+    application_name: 'luarc-asset-api',
+    statement_timeout: opts.statementTimeoutMs,
+    lock_timeout: opts.lockTimeoutMs,
+  });
+  // An idle client that dies (failover, restart, pg_terminate_backend) emits 'error' on the pool.
+  // Unhandled, EventEmitter rethrows it on the process and takes the API down with the database.
+  // The pool has already discarded the client; all we must do is observe it.
+  pool.on('error', opts.onError ?? defaultOnError);
   return new Kysely<Database>({ dialect: new PostgresDialect({ pool }) });
 }

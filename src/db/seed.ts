@@ -32,7 +32,7 @@ export async function seed(db: Db): Promise<void> {
 // CLI entry: `node src/db/seed.ts`
 if (process.argv[1] && import.meta.filename === path.resolve(process.argv[1])) {
   const cfg = loadConfig();
-  const db = createDb(cfg.DATABASE_URL, 2);
+  const db = createDb(cfg.DATABASE_URL, { poolMax: 2 });
   try {
     await seed(db);
     console.log(`seeded demo user ${DEMO_EMAIL} and 5 coupons`);

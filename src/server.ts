@@ -15,7 +15,12 @@ function mustLoadConfig(): Config {
 
 const config = mustLoadConfig();
 const logger = pino({ level: config.LOG_LEVEL, redact: ['req.headers.authorization'] });
-const db = createDb(config.DATABASE_URL, config.PG_POOL_MAX);
+const db = createDb(config.DATABASE_URL, {
+  poolMax: config.PG_POOL_MAX,
+  statementTimeoutMs: config.PG_STATEMENT_TIMEOUT_MS,
+  lockTimeoutMs: config.PG_LOCK_TIMEOUT_MS,
+  onError: (err) => logger.warn({ err: err.message }, 'idle postgres client error'),
+});
 const redis = createRedis(config.REDIS_URL, logger);
 
 // Not awaited on purpose: the API must start even if Redis is down. Until it reconnects,

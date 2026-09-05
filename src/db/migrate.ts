@@ -23,7 +23,7 @@ export async function migrateToLatest(db: Db): Promise<void> {
 // CLI entry: `node src/db/migrate.ts`
 if (process.argv[1] && import.meta.filename === path.resolve(process.argv[1])) {
   const cfg = loadConfig();
-  const db = createDb(cfg.DATABASE_URL, 2);
+  const db = createDb(cfg.DATABASE_URL, { poolMax: 2 });
   try {
     await migrateToLatest(db);
     console.log('migrations up to date');

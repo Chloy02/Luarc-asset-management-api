@@ -11,7 +11,7 @@ let db: Db;
 beforeEach(async () => {
   if (!db) {
     const cfg = loadConfig();
-    db = createDb(cfg.DATABASE_URL, cfg.PG_POOL_MAX);
+    db = createDb(cfg.DATABASE_URL, { poolMax: cfg.PG_POOL_MAX });
     await migrateToLatest(db);
   }
   await sql`TRUNCATE claims, refresh_tokens, coupons, users RESTART IDENTITY CASCADE`.execute(db);

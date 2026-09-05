@@ -6,6 +6,8 @@ const schema = z.object({
   LOG_LEVEL: z.string().default('info'),
   DATABASE_URL: z.string().min(1),
   PG_POOL_MAX: z.coerce.number().int().min(1).default(10),
+  PG_STATEMENT_TIMEOUT_MS: z.coerce.number().int().min(100).default(5000),
+  PG_LOCK_TIMEOUT_MS: z.coerce.number().int().min(50).default(2000),
   REDIS_URL: z.string().min(1),
   JWT_SECRET: z.string().min(32, 'must be at least 32 characters'),
   JWT_ISSUER: z.string().min(1).default('luarc-asset-api'),

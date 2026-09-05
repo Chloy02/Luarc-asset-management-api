@@ -49,7 +49,19 @@ const CHECK_VIOLATIONS: Record<string, Mapping> = {
 
 export function mapPgError(err: unknown): HttpProblem | null {
   const e = err as { code?: unknown; constraint?: unknown } | null;
-  if (!e || typeof e.code !== 'string' || typeof e.constraint !== 'string') return null;
+  if (!e || typeof e.code !== 'string') return null;
+  // Timeouts carry no constraint: the pool bounded the wait so one hot row cannot stall the API.
+  if (e.code === '55P03') {
+    return new HttpProblem(503, 'lock-timeout', 'Database busy', 'The record is locked by another request. Retry shortly.', {
+      retry_after: 1,
+    });
+  }
+  if (e.code === '57014') {
+    return new HttpProblem(503, 'statement-timeout', 'Database timeout', 'The query exceeded its time limit. Retry shortly.', {
+      retry_after: 1,
+    });
+  }
+  if (typeof e.constraint !== 'string') return null;
   const table =
     e.code === '23505' ? UNIQUE_VIOLATIONS : e.code === '23503' ? FK_VIOLATIONS : e.code === '23514' ? CHECK_VIOLATIONS : null;
   const hit = table?.[e.constraint];
@@ -83,6 +95,7 @@ export function errorHandler(logger: Logger): ErrorRequestHandler {
       (req.log ?? logger).error({ err, request_id: requestId }, 'unhandled error');
     }
     if (problem.status === 401) res.setHeader('WWW-Authenticate', 'Bearer');
+    if (problem.status === 503) res.setHeader('Retry-After', '1');
     res
       .status(problem.status)
       .type('application/problem+json')

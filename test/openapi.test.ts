@@ -34,7 +34,7 @@ function documentedOperations(yaml: string): Set<string> {
 function registeredOperations(): Set<string> {
   const config = loadConfig();
   const logger = pino({ level: 'silent' });
-  const db = createDb(config.DATABASE_URL, 1);
+  const db = createDb(config.DATABASE_URL, { poolMax: 1 });
   const redis = createRedis(config.REDIS_URL, logger);
   const { app } = createApp({ config, db, redis, logger });
   const ops = new Set<string>();

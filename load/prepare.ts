@@ -12,7 +12,7 @@ const USERS = Number(process.env.LOAD_USERS ?? 300);
 const UNITS = Number(process.env.LOAD_UNITS ?? 50);
 
 const config = loadConfig();
-const db = createDb(config.DATABASE_URL, 5);
+const db = createDb(config.DATABASE_URL, { poolMax: 5 });
 const tokens = createTokens(config);
 
 try {

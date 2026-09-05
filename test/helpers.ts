@@ -25,7 +25,13 @@ export const TEST_PASSWORD = 'correct horse battery staple';
 export async function bootTestApp(overrides: Partial<Config> = {}, opts: { awaitRedis?: boolean } = {}): Promise<TestContext> {
   const config: Config = { ...loadConfig(), ...overrides };
   const logger = pino({ level: 'silent' });
-  const db = createDb(config.DATABASE_URL, config.PG_POOL_MAX);
+  const db = createDb(config.DATABASE_URL, {
+    poolMax: config.PG_POOL_MAX,
+    statementTimeoutMs: config.PG_STATEMENT_TIMEOUT_MS,
+    lockTimeoutMs: config.PG_LOCK_TIMEOUT_MS,
+    // Tests terminate idle backends on purpose; the pool discards them and we stay quiet.
+    onError: () => {},
+  });
   const redis = createRedis(config.REDIS_URL, logger);
   if (opts.awaitRedis === false) {
     // Mirrors server.ts: start without Redis and let the client retry in the background.
