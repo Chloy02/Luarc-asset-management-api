@@ -1,6 +1,6 @@
 import { sql } from 'kysely';
 import type { CouponStatus, Db } from '../db/index.ts';
-import { decodeStringCursor, page, type Page } from '../lib/pagination.ts';
+import { decodeIntCursor, decodeStringCursor, page, type Page } from '../lib/pagination.ts';
 import { HttpProblem, notFound } from '../lib/problem.ts';
 
 export const STATS_CACHE_KEY = 'cache:coupons:stats';
@@ -251,4 +251,38 @@ export async function couponStats(db: Db): Promise<Stats> {
       FROM c, k
   `.execute(db);
   return { ...rows[0]!, generated_at: new Date().toISOString() };
+}
+
+export interface ClaimHistoryRow {
+  id: number;
+  claimed_at: Date;
+  coupon: { id: string; code: string; title: string; status: CouponStatus; expires_at: Date | null };
+}
+
+export interface HistoryFilters {
+  from?: string;
+  to?: string;
+  coupon_status?: CouponStatus;
+  limit: number;
+  cursor?: string;
+}
+
+/** claims ⋈ coupons for one user, keyset-paginated on claims.id via index claims_user_id_id_idx. */
+export async function listUserClaims(db: Db, userId: string, f: HistoryFilters): Promise<Page<ClaimHistoryRow>> {
+  let q = db
+    .selectFrom('claims as cl')
+    .innerJoin('coupons as c', 'c.id', 'cl.coupon_id')
+    .select(['cl.id', 'cl.claimed_at', 'c.id as coupon_id', 'c.code', 'c.title', 'c.status', 'c.expires_at'])
+    .where('cl.user_id', '=', userId);
+  if (f.from) q = q.where('cl.claimed_at', '>=', new Date(f.from));
+  if (f.to) q = q.where('cl.claimed_at', '<', new Date(f.to));
+  if (f.coupon_status) q = q.where('c.status', '=', f.coupon_status);
+  if (f.cursor) q = q.where('cl.id', '<', decodeIntCursor(f.cursor));
+  const rows = await q.orderBy('cl.id', 'desc').limit(f.limit + 1).execute();
+  const shaped: ClaimHistoryRow[] = rows.map((r) => ({
+    id: r.id,
+    claimed_at: r.claimed_at,
+    coupon: { id: r.coupon_id, code: r.code, title: r.title, status: r.status, expires_at: r.expires_at },
+  }));
+  return page(shaped, f.limit, (r) => r.id);
 }
