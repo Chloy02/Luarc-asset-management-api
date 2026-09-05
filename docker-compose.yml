@@ -24,3 +24,23 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      NODE_ENV: production
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://luarc:luarc@postgres:5432/luarc
+      REDIS_URL: redis://redis:6379/0
+      # Read from ./.env when present so tokens minted by `npm run load:prepare` verify here.
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me-before-any-real-deployment}
+      TRUST_PROXY: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: sh -c "node src/db/migrate.ts && node src/db/seed.ts && node src/server.ts"
