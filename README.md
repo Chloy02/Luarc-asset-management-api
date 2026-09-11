@@ -3,7 +3,7 @@
 A coupon/voucher pool where authenticated users claim limited units, built so that the system stays
 **exactly** consistent when hundreds of users race for the same coupon or edit the same record.
 
-- **Consistency-first.** Every invariant is enforced by Postgres (UNIQUE, CHECK, row locks), not by
+- **Consistency-first.** Every rule is enforced by Postgres (UNIQUE, CHECK, row locks), not by
   application code that hopes nobody races it. The claim path is two SQL statements and zero explicit locks.
 - **Proven, not asserted.** The test suite fires 500 concurrent claims at 50 units and checks that exactly 50
   land and the counter equals the row count. A k6 script does the same over real HTTP.
@@ -62,7 +62,7 @@ npm test                             # real Postgres + Redis, no mocks
 | POST | /auth/refresh | – | Rotate refresh token; replay of a rotated token revokes the whole family |
 | POST | /auth/logout | – | Revoke a refresh token |
 | GET | /me | Bearer | Current user |
-| GET | /me/claims | Bearer | **Your history**: claims ⋈ coupons, filters `from`/`to`/`coupon_status`, keyset pagination |
+| GET | /me/claims | Bearer | **Your history**: your claims joined with their coupons, filters `from`/`to`/`coupon_status`, keyset pagination |
 | POST | /coupons | Bearer | Create a coupon (you become its owner) |
 | GET | /coupons | Bearer | **Global pool**: every coupon with `remaining` and `claimed_by_me`, filters `status`/`available`/`q` |
 | GET | /coupons/stats | Bearer | Aggregate totals, cached 5s in Redis, invalidated on every write |
@@ -119,7 +119,7 @@ erDiagram
   }
 ```
 
-Invariants, all enforced by the database:
+Rules, all enforced by the database:
 
 1. `0 <= claimed_count <= total_quantity` — `CHECK coupons_claimed_within_total`. The oversell backstop.
 2. One claim per (coupon, user) — `UNIQUE claims_coupon_id_user_id_key`.
@@ -158,17 +158,18 @@ Source: [`src/coupons/service.ts`](src/coupons/service.ts) (`claimCoupon`).
 | Alternative | Why not |
 |---|---|
 | `SELECT … FOR UPDATE`, check in app, `UPDATE` | Correct, but two round trips and the check lives in JavaScript. The conditional `UPDATE` takes the same lock with the check in SQL. |
-| `SERIALIZABLE` + retry loop | Correct, but pays serialization-failure retries under exactly the contention we are designing for. Pointless when one row is the whole conflict set. |
+| `SERIALIZABLE` + retry loop | Correct, but forces retries exactly when traffic is heaviest — the opposite of what we want. Overkill when one row is the entire conflict. |
 | Redis / in-process mutex | Not durable, not transactional, wrong layer. The database already owns the row lock. |
 | Read count, then blind `UPDATE SET claimed_count = $n` | Lost update. This is the bug the exercise is about. |
 
-**Why READ COMMITTED is enough.** The predicate is re-checked after the lock is acquired (Postgres's
-EvalPlanQual), so two transactions cannot both see `claimed_count < total_quantity` and both increment past it.
-The unique index serialises duplicate inserts: the second inserter blocks until the first commits, then fails.
+**Why this is safe without a stricter isolation level.** The condition is re-checked after the row lock is
+acquired, so two transactions can never both see `claimed_count < total_quantity` and both increment past it.
+The unique index does the same job for duplicates: the second insert waits for the first to finish, then fails.
 
 **Deadlock freedom.** Every claim touches its own new `claims` row, then one `coupons` row, always in that order.
-The FK check takes `FOR KEY SHARE` on the coupon; the `UPDATE` of non-key columns takes `FOR NO KEY UPDATE`,
-which is compatible with it. Concurrent claims on one coupon simply queue on the row lock.
+The foreign-key check takes a `FOR KEY SHARE` lock on the coupon row; the `UPDATE` of non-key columns takes
+`FOR NO KEY UPDATE` — two Postgres lock types that are allowed to coexist. Concurrent claims on one coupon
+simply wait their turn for the row, one after another.
 
 **Idempotent retries.** A client that times out and retries gets 409 `already-claimed`, and nothing changes.
 
@@ -184,11 +185,11 @@ UPDATE coupons SET …, version = version + 1
 Zero rows means not found, not owner, or stale — the service re-reads to tell you which (404 / 403 / 409 with
 `current_version`). Shrinking `total_quantity` below `claimed_count` is refused by the CHECK constraint → 422.
 
-**Why not ETag / If-Match?** It is the HTTP-native choice and was the first draft. It was dropped because an
-RFC-correct ETag must change whenever the representation changes, and `claimed_count` changes on every claim.
+**Why not ETag / If-Match?** That's the standard HTTP way to do this, and it was the first draft. It was dropped
+because a correct ETag has to change whenever the response body changes, and `claimed_count` changes on every claim.
 An editor of a busy coupon would get 412 in a loop and never land an edit. `version` increments only on edits, so
-edits and claims are independent: they touch disjoint columns under the same row lock, and the CHECK constraint
-arbitrates the one interaction.
+edits and claims are independent: they touch separate columns under the same row lock, and the CHECK constraint
+resolves the one place they can still conflict.
 
 ## Concurrency proof
 
@@ -264,7 +265,7 @@ sequenceDiagram
   Claims are `sub`, `email`, `role`, `aud`, `iss`, `iat`, `exp` — the same shape Supabase Auth issues, so a client
   written against Supabase reads ours unchanged.
 - **Refresh tokens**: 256-bit opaque, stored as SHA-256, rotated on every use. Presenting an already-rotated token
-  is treated as theft and revokes the user's whole token family (OAuth 2.0 Security BCP). A token revoked by logout
+  is treated as theft and revokes the user's whole token family (the standard OAuth practice for this). A token revoked by logout
   is indistinguishable from a rotated one, so refreshing after logout is also treated as reuse and revokes the
   family. Clients must not refresh concurrently.
 - **Not built, on purpose**: verifying Supabase-issued tokens (JWKS, ES256). It would also need user provisioning on
@@ -291,13 +292,15 @@ Indexes and the queries they serve:
 | `coupons_code_key` | code lookup, keyset cursor when unfiltered |
 | `claims_coupon_id_user_id_key` | duplicate-claim gate, and the `claimed_by_me` join when the planner prefers it |
 
-Either `claims_coupon_id_user_id_key` or `claims_user_id_id_idx` can serve the `claimed_by_me` join — both lead
-with a column of the join predicate. The pasted plan below picks `claims_user_id_id_idx`, because on a table
-with one claim row the viewer filter alone is the whole selectivity; on a large table the composite key wins.
+Either `claims_coupon_id_user_id_key` or `claims_user_id_id_idx` can answer the `claimed_by_me` join — both
+start with a column the join actually filters on. The plan below picks `claims_user_id_id_idx`, because with
+only one claim row in the table, filtering by user alone already narrows it down to almost nothing; on a much
+bigger table, the two-column index would win instead.
 
-Pagination is keyset (cursor = last sort key, base64url), not `OFFSET`: stable under concurrent inserts and
-index-friendly at any depth. `claims.id` is a bigint identity so the cursor is exact; timestamps are not used as
-cursors because they lose microseconds in JavaScript.
+Pagination is keyset (the cursor is just the last row's sort key, base64url-encoded), not `OFFSET`: it stays
+correct even while rows are being inserted, and it stays fast no matter how deep you page — `OFFSET` gets slower
+the further in you go. `claims.id` is a bigint identity so the cursor is exact; timestamps are not used as
+cursors because JavaScript loses their microsecond precision.
 
 Both plans below land on the intended index (`claims_user_id_id_idx`, `coupons_status_code_idx`) as a **Bitmap
 Index Scan** rather than a plain Index Scan; that is Postgres's planner choosing the cheaper strategy on a dev
@@ -446,11 +449,12 @@ flowchart LR
 
 ### Scaling notes and the honest ceiling
 
-One hot coupon row serialises its claims at roughly the database's commit latency — thousands per second on
-RDS-class hardware, far above the brief's "hundreds". Past that, the upgrade path is sharded counters or a Redis
-`DECR` reservation with asynchronous reconciliation. Both trade the single-row guarantee for coordination
-complexity, which is the wrong trade at this scale. Everything else — listing, history, stats — scales with
-read replicas and the cache.
+One busy coupon processes its claims one at a time, at roughly the speed the database can commit a
+transaction — thousands per second on real hardware, far above the brief's "hundreds". Past that point, the
+next step would be splitting the counter across multiple rows, or moving it into Redis with a background job
+to keep Postgres in sync — both trade the simple, provably-correct single-row guarantee for extra moving parts,
+which isn't worth it at this scale. Everything else — listing, history, stats — scales normally with read
+replicas and the cache.
 
 **When the hot row is too hot.** Every claim waiting on a contended coupon holds a pool connection while it waits.
 With `PG_POOL_MAX` connections parked on one row, every other endpoint — `/health` included — would starve, and a
@@ -458,18 +462,6 @@ slow coupon would read as a dead API. `lock_timeout` and `statement_timeout` bou
 get the row within `PG_LOCK_TIMEOUT_MS` returns 503 `lock-timeout` (or `statement-timeout` for a query that
 overruns) with `Retry-After: 1`, releasing its connection. That is a bounded failure on one coupon instead of a
 cascading one across the whole instance.
-
-## Trade-offs and omissions
-
-| Left out | Why | Upgrade path |
-|---|---|---|
-| Admin role | Ownership (`created_by`) already gives a clean 401 vs 403 story | A `role` column and a `requireRole` middleware |
-| Redeem step after claiming | Not in the brief | Second conditional update: `UPDATE claims SET status='redeemed' WHERE id=$1 AND status='claimed'` |
-| Per-coupon claim limit > 1 | UNIQUE constraint is provable and makes retries idempotent | Replace UNIQUE with a count inside the transaction under the row lock |
-| Idempotency-Key header | The unique constraint already makes retries safe | Store key → response for non-idempotent endpoints |
-| Supabase JWKS verification | Dead-ends without user provisioning | `jose.createRemoteJWKSet` + upsert user on first sight |
-| Full-text search | `ILIKE` is fine at this pool size | `pg_trgm` GIN index on `code`, `title` |
-| Refresh-token table cleanup | Rows are small and revocation needs history | Nightly `DELETE WHERE expires_at < now() - interval '30 days'` |
 
 ## Project layout
 
