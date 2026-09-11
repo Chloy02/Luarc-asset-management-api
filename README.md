@@ -447,22 +447,6 @@ flowchart LR
 - RDS Multi-AZ for the single source of truth; ElastiCache is disposable — the app degrades without it.
 - Supabase is Postgres, so this schema and every constraint port unchanged if the data layer moves there.
 
-### Scaling notes and the honest ceiling
-
-One busy coupon processes its claims one at a time, at roughly the speed the database can commit a
-transaction — thousands per second on real hardware, far above the brief's "hundreds". Past that point, the
-next step would be splitting the counter across multiple rows, or moving it into Redis with a background job
-to keep Postgres in sync — both trade the simple, provably-correct single-row guarantee for extra moving parts,
-which isn't worth it at this scale. Everything else — listing, history, stats — scales normally with read
-replicas and the cache.
-
-**When the hot row is too hot.** Every claim waiting on a contended coupon holds a pool connection while it waits.
-With `PG_POOL_MAX` connections parked on one row, every other endpoint — `/health` included — would starve, and a
-slow coupon would read as a dead API. `lock_timeout` and `statement_timeout` bound that wait: a claim that cannot
-get the row within `PG_LOCK_TIMEOUT_MS` returns 503 `lock-timeout` (or `statement-timeout` for a query that
-overruns) with `Retry-After: 1`, releasing its connection. That is a bounded failure on one coupon instead of a
-cascading one across the whole instance.
-
 ## Project layout
 
 ```
